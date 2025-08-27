@@ -1,0 +1,712 @@
+# ----- Installation + Set up ----------------- # -----
+#install.packages("BiocManager")
+#BiocManager::install("dada2", version = "3.17")
+#BiocManager::install("phyloseq")
+#BiocManager::install("Biostrings")
+#BiocManager::install("microbiome")
+#install.packages("factoextra")
+#install.packages("ggplot2")
+
+library("dada2")
+library("phyloseq")
+library("Biostrings")
+library("ggplot2")
+library(reshape2)
+library("readxl")
+library("writexl")
+library("tidyverse")
+library("ggpubr") 
+library("microbiome")
+library("vegan")
+library("factoextra") 
+library("lme4") 
+library("RColorBrewer") 
+library("gridExtra")
+library("DESeq2")
+library("ComplexHeatmap") 
+library("cowplot") 
+library("ggh4x") 
+library("rstatix") 
+library(igraph)
+library(Hmisc)  
+library(scales)
+
+theme_set(theme_bw())
+
+#--------------------------------------------------------------------------------------#
+#                           Input and organisation of Samples 
+#--------------------------------------------------------------------------------------#
+
+# Give path to the samples
+path <- "reads/"
+list.files(path)
+
+sample_table <- read.table("sample_info.tsv", header = TRUE)
+# ----- Input and organisation of Samples ----- # -----
+
+# Load sample metadata
+sample_table <- read.table("sample_info.tsv", header = TRUE)
+
+# Keep only Co-housing + Ageing (control)
+keep_ids <- sample_table[sample_table$treatment_group %in% c("Co-housing", "Ageing"), "sample_id"]
+
+# Forward and reverse fastq filenames
+fnFs <- sort(list.files(path, pattern="_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq.gz", full.names = TRUE))
+
+# Subset files only for the samples we want
+fnFs <- fnFs[sub("reads//(.+)_clean_1.fastq.gz", "\\1", fnFs) %in% keep_ids]
+fnRs <- fnRs[sub("reads//(.+)_clean_2.fastq.gz", "\\1", fnRs) %in% keep_ids]
+
+# Extract sample names
+sample.names <- sub("_clean_1.fastq.gz", "", basename(fnFs))
+
+# Keep only desired samples
+fnFs <- fnFs[sample.names %in% keep_ids]
+fnRs <- fnRs[sample.names %in% keep_ids]
+sample.names <- sample.names[sample.names %in% keep_ids]
+
+
+# Now continue with filterAndTrim, learnErrors, dada, mergePairs, etc...
+
+
+# Inspect the quality of each sample in forward and reverse 
+plotQualityProfile(fnFs[1:3])
+plotQualityProfile(fnRs[1:3])
+
+plotQualityProfile(sample(fnRs,3))
+
+# Assign filtered file names
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_1_filt.sequence.txt.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_2_filt.sequence.txt.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+
+# Using standard filtering parameters and the defined trimming based on the plot quality
+##### Trimming our sequences
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,240), # 240, 160 normally
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, # remove any phi sequence
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+
+plotQualityProfile(sample(filtFs,3))
+
+# Learn Error Rates
+# The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for 
+# each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. 
+# The red line shows the error rates expected under the nominal definition of the Q-score. 
+errF <- learnErrors(filtFs, multithread=TRUE)  
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+plotErrors(errF, nominalQ=TRUE)
+
+# Sample Interference # create data forward and data reverse object
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE) # shows the copies of unique reads - we should merge them
+
+# Inspecting the returned dada-class object
+dadaFs[[1]]
+dadaRs[[1]]
+
+#--------------------------------------------------------------------------------------#
+#                                     Merge Paired reads 
+#--------------------------------------------------------------------------------------#
+
+## Merging is performed by aligning the denoised forward reads with the 
+## reverse-complement of the corresponding denoised reverse reads, 
+## and then constructing the merged “contig” sequences
+
+# By default, merged sequences are only output if the forward and reverse reads 
+# overlap by at least 12 bases, and are identical to each other in the 
+# overlap region (but these conditions can be changed via function arguments)
+
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+# Construct an amplicon sequence variant table (ASV) table, 
+# a higher-resolution version of the OTU table produced by traditional methods.
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Remove ASVs with very low global count
+## make histogram for rowsum and the higher peak is higher low count so remove them
+
+sum(colSums(seqtab) > 10)
+
+# Get total counts per ASV
+asv_counts <- colSums(seqtab)
+
+# Keep only ASVs with >10 counts
+filtered_counts <- asv_counts[asv_counts > 10]
+
+# Plot histogram
+hist(filtered_counts,
+     breaks = 50,
+     main = "Histogram of ASV counts (>10)",
+     xlab = "Total ASV counts")
+
+seqtab <- seqtab[, colSums(seqtab) > 10]
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+# The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence 
+# variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are 
+# identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant 
+# “parent” sequences.
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="pooled", multithread=TRUE, verbose=TRUE)
+
+dim(seqtab.nochim) #######   you can mention in your result ----- in the project
+dim(seqtab) ########         you can mention in your result ----- in the prject
+
+# gives % of reads kept after removing chimeras
+(1-(sum(seqtab.nochim)/sum(seqtab)))*100
+
+# ----- Track reads through the pipeline ------ # -----
+
+# As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline: 
+
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+# table of what made it through each step
+
+df <- melt(track)
+ggplot(df, aes(Var2, value, group = Var1, colour = Var1)) + geom_line() + xlab("Pipeline step")
+
+# The dada2 package also implements a method to make species level assignments 
+# based on exact matching between ASVs and sequenced reference strains
+
+# assign taxonomy based on a downloaded reference database
+taxa <- assignTaxonomy(seqtab.nochim, "silvadb/silva_nr99_v138.1_wSpecies_train_set.fa.gz",
+                       multithread=TRUE)
+
+
+#--------------------------------------------------------------------------------------#
+#                                     Phyloseq 
+#--------------------------------------------------------------------------------------#
+
+# define a colour palette
+palette_OkabeIto <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442",
+                      "#0072B2", "#D55E00", "#CC79A7", "#999999")
+# create a function to define number of colours requested using the defined palette as a template
+getOI = colorRampPalette(palette_OkabeIto)
+
+# set theme               
+theme_set(theme_bw())
+
+
+# get metadata 
+# Metadata
+metadata <- read_tsv("sample_info.tsv") %>% as.data.frame()
+metadata <- metadata[metadata$sample_id %in% keep_ids, ]
+metadata <- metadata %>% column_to_rownames(var = "sample_id")
+
+# align rownames of OTU table and metadata table
+sample.names <- sapply(strsplit(rownames(seqtab.nochim), "lane1RebeccaR"), `[`, 1)
+rownames(seqtab.nochim) <- sample.names
+seqtab.nochim <- seqtab.nochim %>% as.data.frame()
+
+
+# make ps object -  create the phyloseq object
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata), 
+               tax_table(taxa))
+
+View(sample_data(ps))
+
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+plot_ordination(ps.prop, ord.nmds.bray, color="Facility", title="Bray NMDS")
+
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps, fill="Phylum") + facet_grid(~treatment_group, scales="free_x", space = 'free')
+plot_bar(ps.top20, fill="Class") + facet_grid(~treatment_group, scales="free_x", space = 'free')
+plot_bar(ps.top20, fill="Order") + facet_grid(~treatment_group, scales="free_x", space = 'free')
+
+#--------------------------------------------------------------------------------------#
+#                              Diversity Analysis 
+#--------------------------------------------------------------------------------------#
+
+# alpha div
+alpha_div <- microbiome::alpha(ps, index = c("Chao1", "Shannon")) 
+new_Metadata <-  merge(sample_data(ps), alpha_div, by=0, all.x=TRUE)
+new_Metadata <- new_Metadata %>% remove_rownames() %>% column_to_rownames(var="Row.names")
+sample_data(ps) = new_Metadata
+ggplot(alpha_div, aes(x=treatment_group, y=Shannon, fill=treatment_group)) + geom_boxplot() + theme_bw()
+
+alpha_div_clean <- alpha_div[, !colnames(alpha_div) %in% colnames(as(sample_data(ps), "data.frame"))]
+plot_df <- cbind(alpha_div_clean, as(sample_data(ps), "data.frame"))
+ggplot(plot_df, aes(x = treatment_group, y = diversity_shannon, fill = treatment_group)) +
+  geom_boxplot() +
+  theme_bw()
+
+#--------------------------------------------------------------------------------------#
+#                              Beta Diversity
+#--------------------------------------------------------------------------------------#
+
+#### dispersion plot
+bd <- betadisper(dist_bc, meta$treatment_group)
+permutest(bd)
+
+boxplot(bd, main="Beta-dispersion per group")
+
+#-------------------------------------- shrinkage ------------------------------------#
+  
+# 1) Run DESeq2
+  dds <- phyloseq_to_deseq2(ps, ~ treatment_group)
+dds <- DESeq(dds)
+
+# 2) Get results (Co-housing vs Ageing)
+res <- results(dds, contrast = c("treatment_group", "Co-housing", "Ageing"))
+
+#shrinkage
+library(apeglm)
+res_shrink <- lfcShrink(dds, coef=2, type="apeglm")
+
+# 4) Filter significant taxa (padj < 0.05)
+sig_res <- res_shrink[which(res_shrink$padj < 0.05), ]
+sig_res <- sig_res[order(sig_res$log2FoldChange, decreasing=TRUE), ]
+
+#--------------------------------------------------------------------------------------#
+#                              Heatmap of Top 10 genera
+#--------------------------------------------------------------------------------------#
+
+# log2FC
+top_taxa <- rownames(sig_res)[1:10]
+
+# counts
+norm_counts <- counts(dds, normalized=TRUE)
+norm_top <- norm_counts[top_taxa, ]
+
+# (scale per row)
+norm_top_scaled <- t(scale(t(norm_top)))
+
+# Heatmap
+library(pheatmap)
+pheatmap(norm_top_scaled,
+         annotation_col = as.data.frame(colData(dds)[, "treatment_group", drop=FALSE]),
+         color = colorRampPalette(c("navy","white","firebrick3"))(50),
+         main = "Top 10 Differentially Abundant Genera")
+
+
+#--------------------------------------------------------------------------------------#
+#                                    PCoA
+#--------------------------------------------------------------------------------------#
+
+ps_rel <- transform_sample_counts(ps, function(x) x/sum(x))
+dist_bc <- phyloseq::distance(ps_rel, method="bray")
+
+# CLR 
+ps_clr <- microbiome::transform(ps, "clr")
+dist_ai <- phyloseq::distance(ps_clr, method="euclidean")
+
+meta <- data.frame(sample_data(ps))
+
+# PERMANOVA 
+adon_bc <- adonis2(as.matrix(dist_bc) ~ treatment_group, data=meta, permutations=999)
+bd_bc   <- betadisper(dist_bc, meta$treatment_group); disp_bc <- permutest(bd_bc)
+
+adon_ai <- adonis2(as.matrix(dist_ai) ~ treatment_group, data=meta, permutations=999)
+bd_ai   <- betadisper(dist_ai, meta$treatment_group); disp_ai <- permutest(bd_ai)
+
+# PCoA 
+ord_bc <- ordinate(ps_rel, method="PCoA", distance=dist_bc)
+plot_ordination(ps_rel, ord_bc, color="treatment_group") + stat_ellipse() +
+  labs(title="PCoA (Bray–Curtis)")
+
+#--------------------------------------------------------------------------------------#
+#                                   Heatmap
+#--------------------------------------------------------------------------------------#
+
+# Extract OTU table
+otu_mat <- as(otu_table(ps), "matrix")
+
+# Add 1 to all counts
+otu_mat <- otu_mat + 1
+
+# Replace the OTU table in phyloseq object
+otu_table(ps) <- otu_table(otu_mat, taxa_are_rows = taxa_are_rows(ps))
+
+dds <- phyloseq_to_deseq2(ps, ~ treatment_group)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("treatment_group", "Co-housing", "Ageing"))
+
+res_df <- as.data.frame(res)
+res_df$ASV <- rownames(res_df)   # keep the ASV/OTU names
+
+res_df$significant <- ifelse(res_df$padj < 0.05, "Yes", "No")
+
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.6) +
+  theme_bw() +
+  scale_color_manual(values = c("No" = "gray", "Yes" = "red")) +
+  xlab("Log2 Fold Change") +
+  ylab("-Log10 adjusted p-value") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+
+#  Add a column for significance
+res_df$significant <- ifelse(res_df$padj < 0.05, "Yes", "No")
+
+
+# Select top 50 taxa by abundance
+top50 <- names(sort(taxa_sums(ps), decreasing = TRUE))[1:50]
+ps_top50 <- prune_taxa(top50, ps)
+
+#  Convert OTU table to matrix
+otu_mat <- as(otu_table(ps_top50), "matrix")
+
+# If taxa are columns, transpose to have taxa as rows
+if(!taxa_are_rows(ps_top50)) {
+  otu_mat <- t(otu_mat)
+}
+
+#  Optional: scale to relative abundance per sample
+otu_mat_scaled <- apply(otu_mat, 2, function(x) x / sum(x))
+
+#  Plot heatmap
+Heatmap(otu_mat_scaled,
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        show_row_names = TRUE,
+        show_column_names = TRUE,
+        name = "Relative Abundance")
+
+
+#----------------------------------------------------------------------#
+###                      Biological analysis                         ###
+#----------------------------------------------------------------------#
+
+# relative abundance
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+
+# Akkermansia
+ak_df <- psmelt(ps_rel) %>% 
+  filter(Genus == "bifidobacterium") %>% 
+  select(Sample, Abundance, treatment_group, treatment) %>% 
+  mutate(treatment = factor(treatment, 
+                            levels = c("Week1", "Week4", "Week20", "Week50", "Week100", "Co-Young", "Co-Aged")))
+
+ #bar plot
+ggplot(ak_df, aes(x = treatment, y = Abundance, fill = treatment_group)) +
+  stat_summary(fun = mean, geom = "bar", 
+               position = position_dodge(width = 0.8), width = 0.7)  +
+   theme_bw() +
+  labs(title = "Bacteroides abundance across weeks",
+       y = "Relative abundance", x = "Week") +
+  scale_fill_manual(values = c("Ageing" = "#E69F00", "Co-housing" = "#56B4E9"))
+
+
+#----------------------------------------------------------------------#
+#                     Aged to Young plot
+#----------------------------------------------------------------------#
+
+# 0) Long table from your phyloseq object
+df <- psmelt(ps_rel) %>%
+  filter(!is.na(Genus)) %>%
+  select(Sample, Genus, Abundance, treatment_group, treatment)
+
+# 1) Pick youngest and oldest weeks **present** in Ageing controls (auto-detect)
+age_weeks <- df %>%
+  filter(treatment_group == "Ageing", grepl("^Week", treatment)) %>%
+  distinct(treatment) %>%
+  mutate(week_num = readr::parse_number(treatment)) %>%
+  arrange(week_num)
+
+young_ref <- age_weeks$treatment[2]             # e.g., "Week1" or "Week4"
+aged_ref  <- age_weeks$treatment[nrow(age_weeks)] # e.g., "Week100"
+
+message("Using references -> YOUNG: ", young_ref, " | AGED: ", aged_ref)
+
+# 2) Compute mean relative abundance for three states per Genus
+means <- df %>%
+  mutate(state = case_when(
+    treatment_group == "Ageing"    & treatment == young_ref ~ "Young_ctl",
+    treatment_group == "Ageing"    & treatment == aged_ref  ~ "Aged_ctl",
+    treatment_group == "Co-housing" & treatment == "Co-Young" ~ "CoYoung",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(state)) %>%
+  group_by(Genus, state) %>%
+  summarise(mean_abund = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = state, values_from = mean_abund, values_fill = 0)
+
+# 3) Find “aged→young transfer” candidates:
+#    aged-enriched (Aged_ctl > Young_ctl) AND CoYoung > Young_ctl
+cands <- means %>%
+  mutate(
+    aged_enriched = Aged_ctl - Young_ctl,
+    rise_in_coyoung = CoYoung - Young_ctl,
+    # simple transfer score: how much of the aged-young gap did Co-Young close?
+    transfer_score = ifelse(aged_enriched > 0, pmin(pmax(rise_in_coyoung / aged_enriched, 0), 1), 0)
+  ) %>%
+  filter(aged_enriched > 0, rise_in_coyoung > 0) %>%
+  arrange(desc(transfer_score), desc(aged_enriched))
+
+# 4) Choose top genera to show (keep it readable on a poster)
+topN <- 12
+top_genera <- head(cands$Genus, topN)
+
+plot_df <- means %>%
+  filter(Genus %in% top_genera) %>%
+  pivot_longer(cols = c(Young_ctl, Aged_ctl, CoYoung),
+               names_to = "state", values_to = "mean_abund") %>%
+  mutate(state = factor(state, levels = c("Young_ctl","CoYoung","Aged_ctl")))
+
+p <- ggplot(plot_df, aes(x = Genus, y = mean_abund, fill = state)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  coord_flip() +
+  labs(
+    title = paste0("Aged→Young transfer candidates (Young=", young_ref, ", Aged=", aged_ref, ")"),
+    x = NULL, y = "Mean relative abundance"
+  ) +
+  scale_fill_manual(
+    values = c("Young_ctl" = "#56B4E9", "CoYoung" = "#999999", "Aged_ctl" = "#E69F00"),
+    name = NULL,
+    labels = c("Young control", "Co-Young", "Aged control")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +   # << remove gap
+  theme_bw() +
+  theme(legend.position = "top")
+
+p
+
+#----------------------------------------------------------------------#
+#                     Young to Aged plot
+#----------------------------------------------------------------------#
+
+
+# Long table
+df0 <- psmelt(ps_rel) %>%
+  filter(!is.na(Genus)) %>%
+  select(Sample, Genus, Abundance, treatment_group, treatment)
+
+# Helper to pick reference weeks (prefer Week4 for Young; max week for Aged)
+age_tbl <- df0 %>%
+  filter(treatment_group == "Ageing", grepl("^Week", treatment)) %>%
+  distinct(treatment) %>%
+  mutate(wk = readr::parse_number(treatment)) %>%
+  arrange(wk)
+
+if ("Week4" %in% age_tbl$treatment) {
+  young_ref <- "Week4"
+} else if (nrow(age_tbl) >= 2) {
+  young_ref <- age_tbl$treatment[1]   # earliest week if Week4 not present
+} else {
+  young_ref <- age_tbl$treatment[1]
+}
+aged_ref <- age_tbl$treatment[nrow(age_tbl)]  # latest week (e.g., Week100)
+
+# Detect Co-Aged label robustly
+norm <- function(x) gsub("[^a-z0-9]+", "", tolower(x))
+co_tbl <- df0 %>%
+  mutate(tg_norm = norm(treatment_group), tr_norm = norm(treatment)) %>%
+  filter(tg_norm == "cohousing") %>%
+  dplyr::count(treatment, tr_norm, sort = TRUE)
+
+co_aged_label <- (co_tbl %>% dplyr::filter(grepl("aged|old", tr_norm)) %>% slice(1) %>% pull(treatment))
+if (is.null(co_aged_label) || is.na(co_aged_label)) stop("Couldn't find Co-Aged label in metadata.")
+
+# Mean abundance for the three states needed
+means_Y2A <- df0 %>%
+  mutate(state = case_when(
+    treatment_group == "Ageing"     & treatment == young_ref     ~ "Young_ctl",
+    treatment_group == "Co-housing" & treatment == co_aged_label ~ "CoAged",
+    treatment_group == "Ageing"     & treatment == aged_ref      ~ "Aged_ctl",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(state)) %>%
+  group_by(Genus, state) %>%
+  summarise(mean_abund = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = state, values_from = mean_abund, values_fill = 0)
+
+# Find Young→Aged transfer candidates
+cands_Y2A <- means_Y2A %>%
+  mutate(
+    young_enriched   = Young_ctl - Aged_ctl,
+    rise_in_coaged   = CoAged    - Aged_ctl,
+    transfer_score   = ifelse(young_enriched > 0,
+                              pmin(pmax(rise_in_coaged / young_enriched, 0), 1), 0)
+  ) %>%
+  filter(young_enriched > 0, rise_in_coaged > 0) %>%
+  arrange(desc(transfer_score), desc(young_enriched))
+
+topN <- 12
+top_g2 <- head(cands_Y2A$Genus, topN)
+
+# Plot (Aged_ctl, CoAged, Young_ctl) so you can see movement toward young
+plot_df2 <- means_Y2A %>%
+  filter(Genus %in% top_g2) %>%
+  pivot_longer(cols = c(Aged_ctl, CoAged, Young_ctl),
+               names_to = "state", values_to = "mean_abund") %>%
+  mutate(state = factor(state, levels = c("Aged_ctl","CoAged","Young_ctl")))
+
+p_y2a <- ggplot(plot_df2, aes(x = Genus, y = mean_abund, fill = state)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  coord_flip(clip = "off") +
+  labs(title = paste0("Young → Aged transfer candidates (Young=", young_ref, ", Aged=", aged_ref, ")"),
+       x = NULL, y = "Mean relative abundance") +
+  scale_fill_manual(values = c("Aged_ctl" = "#E69F00", "CoAged" = "#B3B3B3", "Young_ctl" = "#56B4E9"),
+                    name = NULL,
+                    labels = c("Aged control","Co-Aged","Young control")) +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.02))) +
+  theme_bw() + theme(legend.position = "top", panel.grid.minor = element_blank())
+p_y2a
+
+
+#------------------------------------------------------------------------------------#
+#                     Top genera changing in the same direction  
+#------------------------------------------------------------------------------------#
+
+# --- Co-abundance analysis among genera in Co-Young samples ---
+# Goal:
+# 1) Build a genus-by-genus Spearman correlation (on CLR-transformed abundances).
+# 2) Show a heatmap for the top transfer genera (or top-variance genera if none supplied).
+# 3) (Optional) Draw a simple correlation network.
+# 4) Save figures and export edge tables for your poster.
+
+
+# --- Choose a different Young reference week and replot ---
+
+# === Same-direction change between Co-Young and Co-Aged (FULL SCRIPT) ===
+library(tidyverse)
+library(phyloseq)
+library(ggplot2)
+
+# ---- 0) Long table from your phyloseq object ----
+df0 <- psmelt(ps_rel) %>%
+  filter(!is.na(Genus)) %>%
+  select(Sample, Genus, Abundance, treatment_group, treatment)
+
+# Helper to normalize strings (lowercase, remove non-alnum)
+norm <- function(x) gsub("[^a-z0-9]+", "", tolower(x))
+
+# ---- 1) Pick Young/Aged references from Ageing weeks ----
+age_tbl <- df0 %>%
+  filter(treatment_group == "Ageing", grepl("^Week", treatment)) %>%
+  distinct(treatment) %>%
+  mutate(wk = readr::parse_number(treatment)) %>%
+  arrange(wk)
+
+if (nrow(age_tbl) == 0) stop("No Ageing weeks found in metadata.")
+
+# Prefer Week4; else use the 2nd smallest week if available; else the smallest
+if ("Week4" %in% age_tbl$treatment) {
+  young_ref <- "Week4"
+} else if (nrow(age_tbl) >= 2) {
+  young_ref <- age_tbl$treatment[2]
+} else {
+  young_ref <- age_tbl$treatment[1]
+}
+aged_ref <- age_tbl$treatment[nrow(age_tbl)]  # largest week (e.g., Week100)
+cat("Using references -> YOUNG:", young_ref, "| AGED:", aged_ref, "\n")
+
+# ---- 2) Detect Co-Young / Co-Aged labels robustly (case/spacing/hyphen tolerant) ----
+co_tbl <- df0 %>%
+  mutate(tg_norm = norm(treatment_group), tr_norm = norm(treatment)) %>%
+  filter(tg_norm == "cohousing") %>%
+  dplyr::count(treatment, tr_norm, sort = TRUE)   # avoid Hmisc::count conflict
+
+if (nrow(co_tbl) == 0) stop("No Co-housing samples found.")
+
+co_young_label <- (co_tbl %>% dplyr::filter(grepl("young", tr_norm)) %>% slice(1) %>% pull(treatment))
+co_aged_label  <- (co_tbl %>% dplyr::filter(grepl("aged|old", tr_norm)) %>% slice(1) %>% pull(treatment))
+
+if (is.null(co_young_label) || is.na(co_young_label)) stop("Couldn't find Co-Young label in metadata.")
+if (is.null(co_aged_label)  || is.na(co_aged_label))  stop("Couldn't find Co-Aged label in metadata.")
+
+cat("Detected Co-Young label:", co_young_label, "\n")
+cat("Detected Co-Aged  label:", co_aged_label,  "\n")
+
+# ---- 3) Mean abundance per Genus across the 4 states ----
+means4 <- df0 %>%
+  mutate(state = case_when(
+    treatment_group == "Ageing"     & treatment == young_ref      ~ "Young_ctl",
+    treatment_group == "Co-housing" & treatment == co_young_label ~ "CoYoung",
+    treatment_group == "Co-housing" & treatment == co_aged_label  ~ "CoAged",
+    treatment_group == "Ageing"     & treatment == aged_ref       ~ "Aged_ctl",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(state)) %>%
+  group_by(Genus, state) %>%
+  summarise(mean_abund = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = state, values_from = mean_abund, values_fill = 0)
+
+if (nrow(means4) == 0) stop("No rows in means4; check your state labels.")
+
+# ---- 4) Changes vs controls and direction class ----
+sum_df <- means4 %>%
+  mutate(
+    change_y  = CoYoung - Young_ctl,
+    change_a  = CoAged  - Aged_ctl,
+    direction = case_when(
+      change_y > 0 & change_a > 0 ~ "Both up (↑↑)",
+      change_y < 0 & change_a < 0 ~ "Both down (↓↓)",
+      TRUE                        ~ "Opposite (↑↓ / ↓↑)"
+    ),
+    mean_level = rowMeans(across(c(Young_ctl, CoYoung, CoAged, Aged_ctl)), na.rm = TRUE)
+  )
+
+# ---- 5) Quadrant scatter plot ----
+p_quad <- ggplot(sum_df, aes(x = change_y, y = change_a, color = direction, size = mean_level)) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.6) +
+  geom_point(alpha = 0.9) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  scale_color_manual(values = c(
+    "Both up (↑↑)" = "#2ECC71",
+    "Both down (↓↓)" = "#3498DB",
+    "Opposite (↑↓ / ↓↑)" = "#E74C3C"
+  )) +
+  labs(
+    title = paste0("Same-direction changes (Young=", young_ref, ", Aged=", aged_ref, ")"),
+    x = "Change in Co-Young vs Young control",
+    y = "Change in Co-Aged vs Aged control",
+    color = NULL
+  ) +
+  theme_bw()
+
+# ---- 6) Bar plot for top same-direction genera (↑↑ or ↓↓) ----
+same_dir <- sum_df %>%
+  filter(direction != "Opposite (↑↓ / ↓↑)") %>%
+  mutate(total_change = abs(change_y) + abs(change_a)) %>%
+  arrange(desc(total_change))
+
+topK  <- min(6, nrow(same_dir))
+top_g <- head(same_dir$Genus, topK)
+
+bar_df <- means4 %>%
+  filter(Genus %in% top_g) %>%
+  pivot_longer(cols = c(Young_ctl, CoYoung, CoAged, Aged_ctl),
+               names_to = "state", values_to = "mean_abund") %>%
+  mutate(state = factor(state, levels = c("Young_ctl","CoYoung","CoAged","Aged_ctl")))
+
+p_bar <- ggplot(bar_df, aes(x = Genus, y = mean_abund, fill = state)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  coord_flip(clip = "off") +
+  labs(title = "Top genera changing in the same direction",
+       x = NULL, y = "Mean relative abundance") +
+  scale_fill_manual(values = c("Young_ctl"="#56B4E9","CoYoung"="#CC79A7","CoAged"="#B3B3B3","Aged_ctl"="#E69F00"),
+                    name = NULL) +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.02))) +
+  theme_bw() + theme(legend.position = "top", panel.grid.minor = element_blank())
+
+# ---- 7) Show
+p_quad
+p_bar
